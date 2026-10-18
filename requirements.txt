@@ -1,0 +1,7 @@
+streamlit
+pandas
+altair
+requests
+beautifulsoup4
+curl_cffi
+matplotlib
