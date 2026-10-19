@@ -224,19 +224,22 @@ def parse_euromillones_generico(soup, texto, fuente):
     return None
 
 class ScraperGenerico:
-    """Primitiva y Euromillones: laverdad.es y combinacionganadora.com."""
+    """Primitiva, Euromillones y Bonoloto (2.ª fuente): laverdad.es y combinacionganadora.com."""
     FUENTES = {
         "la-primitiva": [("laverdad.es", "https://resultados-loteria.laverdad.es/primitiva"),
                          ("combinacionganadora.com", "https://www.combinacionganadora.com/primitiva")],
         "euromillones": [("laverdad.es", "https://resultados-loteria.laverdad.es/euromillones"),
                          ("combinacionganadora.com", "https://www.combinacionganadora.com/euromillones")],
+        "bonoloto":     [("combinacionganadora.com", "https://www.combinacionganadora.com/bonoloto")],
     }
 
     def __init__(self):
         self.s = requests.Session()
         self.s.headers.update(HEADERS)
 
-    def obtener(self, juego_key):
+    def candidatos(self, juego_key):
+        """Generador: devuelve el resultado de cada fuente que responda, en orden.
+        Así, si el primero se rechaza al validarlo, se prueba el siguiente."""
         for nombre, url in self.FUENTES.get(juego_key, []):
             try:
                 resp = self.s.get(url, timeout=20)
@@ -247,15 +250,16 @@ class ScraperGenerico:
                 continue
             soup = BeautifulSoup(resp.text, "html.parser")
             texto = soup.get_text(separator="\n", strip=True)
-            if juego_key == "la-primitiva":
-                r = parse_primitiva_generico(soup, texto, nombre)
-            else:
+            if juego_key == "euromillones":
                 r = parse_euromillones_generico(soup, texto, nombre)
+            else:
+                r = parse_primitiva_generico(soup, texto, nombre)
+                if r: r.juego = juego_key
             if r:
-                return r
-            log.warn(f"{nombre} ({juego_key}): sin datos")
+                yield r
+            else:
+                log.warn(f"{nombre} ({juego_key}): sin datos")
             time.sleep(DELAY)
-        return None
 
 # ──────────────────────────────────────────────
 # Scraper 1: La Verdad (Bonoloto y Lotería Nacional)
@@ -586,40 +590,28 @@ class ScraperBenidorm:
 # ==========================================
 # FUNCIÓN DE ACTUALIZACIÓN (con fallback automático)
 # ==========================================
-def obtener_ultimo(juego_key: str, juego_nombre: str) -> Optional[Resultado]:
-    """Prueba múltiples fuentes en orden hasta que una funcione."""
-
-    # ── Eurodreams: fuentes dedicadas ──
+def candidatos_ultimo(juego_key: str):
+    """Generador: va devolviendo el último resultado de cada fuente, por orden de preferencia.
+    Quien lo llama valida cada uno y pasa al siguiente si se rechaza."""
     if juego_key == "eurodreams":
-        log.info(f"  Probando eu-dreams.com / combinacionganadora.com...")
+        log.info("  Probando eu-dreams.com / combinacionganadora.com...")
         r = ScraperEuroDreams().obtener()
-        if r: return r
-        log.info(f"  → Fallback: loteria1benidorm.com...")
-        for rb in ScraperBenidorm().obtener_todos():
-            if rb.juego == "eurodreams": return rb
-        return None
-
-    # ── Bonoloto y Lotería Nacional ──
-    if juego_key in ("bonoloto", "loteria-nacional"):
-        log.info(f"  Probando laverdad.es...")
+        if r: yield r
+    elif juego_key in ("bonoloto", "loteria-nacional"):
+        log.info("  Probando laverdad.es...")
         r = ScraperLaVerdad().obtener(juego_key)
-        if r: return r
-        log.info(f"  → Fallback: loteria1benidorm.com...")
-        for rb in ScraperBenidorm().obtener_todos():
-            if rb.juego == juego_key: return rb
-        return None
-
-    # ── La Primitiva y Euromillones ──
-    if juego_key in ("la-primitiva", "euromillones"):
-        log.info(f"  Probando laverdad.es / combinacionganadora.com...")
-        r = ScraperGenerico().obtener(juego_key)
-        if r: return r
-        log.info(f"  → Fallback: loteria1benidorm.com...")
-        for rb in ScraperBenidorm().obtener_todos():
-            if rb.juego == juego_key: return rb
-        return None
-
-    return None
+        if r: yield r
+        if juego_key == "bonoloto":
+            log.info("  → Probando combinacionganadora.com...")
+            yield from ScraperGenerico().candidatos("bonoloto")
+    elif juego_key in ("la-primitiva", "euromillones"):
+        log.info("  Probando laverdad.es / combinacionganadora.com...")
+        yield from ScraperGenerico().candidatos(juego_key)
+    else:
+        return
+    log.info("  → Fallback: loteria1benidorm.com...")
+    for rb in ScraperBenidorm().obtener_todos():
+        if rb.juego == juego_key: yield rb
 
 def validar_resultado(juego, fecha, numeros_str, reintegro, db_conn):
     """Devuelve None si el sorteo es creíble o el motivo del rechazo.
@@ -659,53 +651,49 @@ def validar_resultado(juego, fecha, numeros_str, reintegro, db_conn):
         return f"combinación idéntica a un sorteo de {fila[0]} del {fila[1]}"
     return None
 
+def _preparar_registro(juego, resultado):
+    """Convierte un Resultado en (numeros_str, reintegro), o None si está incompleto."""
+    if juego == "Loteria Nacional":
+        if not resultado.primer_premio: return None
+        return str(resultado.primer_premio).zfill(5), 0
+    if juego == "Euromillones":
+        if len(resultado.numeros) < 5 or len(resultado.estrellas) < 2: return None
+        return ",".join(map(str, sorted(resultado.numeros[:5]) + sorted(resultado.estrellas[:2]))), 0
+    if not resultado.numeros or len(resultado.numeros) < 6: return None
+    reint = resultado.reintegro if resultado.reintegro is not None else (resultado.clave if resultado.clave is not None else 0)
+    return ",".join(map(str, sorted(resultado.numeros[:6]))), reint
+
 def actualizar_base_datos(juego, db_conn):
     log.info(f"Actualizando {juego}...")
     try:
         juego_key = juego.lower().replace(" ", "-")
-        resultado = obtener_ultimo(juego_key, juego)
-
-        if resultado and resultado.fecha:
-            log.ok(f"  Conexión exitosa vía {resultado.fuente}. Fecha: {resultado.fecha}")
-
-            if juego == "Loteria Nacional":
-                if resultado.primer_premio:
-                    numeros_str = str(resultado.primer_premio).zfill(5)
-                    reintegro = 0
-                else:
-                    log.warn(f"  {juego}: sin número de 5 cifras.")
-                    return
-            elif juego == "Euromillones":
-                if len(resultado.numeros) < 5 or len(resultado.estrellas) < 2:
-                    log.warn(f"  {juego}: datos incompletos.")
-                    return
-                numeros_str = ",".join(map(str, sorted(resultado.numeros[:5]) + sorted(resultado.estrellas[:2])))
-                reintegro = 0
-            else:
-                if not resultado.numeros or len(resultado.numeros) < 6:
-                    log.warn(f"  {juego}: datos incompletos.")
-                    return
-                numeros_str = ",".join(map(str, sorted(resultado.numeros[:6])))
-                reintegro = resultado.reintegro if resultado.reintegro is not None else (resultado.clave if resultado.clave is not None else 0)
-
+        cursor = db_conn.cursor()
+        for resultado in candidatos_ultimo(juego_key):
+            if not resultado.fecha:
+                log.warn(f"  {resultado.fuente}: sin fecha, descartado.")
+                continue
+            registro = _preparar_registro(juego, resultado)
+            if not registro:
+                log.warn(f"  {resultado.fuente}: datos incompletos, descartado.")
+                continue
+            numeros_str, reintegro = registro
+            cursor.execute("SELECT id FROM sorteos WHERE juego=? AND fecha=?", (juego, resultado.fecha))
+            if cursor.fetchone():
+                log.ok(f"  Conexión exitosa vía {resultado.fuente}. {juego}: {resultado.fecha} ya estaba registrado.")
+                return
+            motivo = validar_resultado(juego, resultado.fecha, numeros_str, reintegro, db_conn)
+            if motivo:
+                log.warn(f"  {juego}: RECHAZADO ({resultado.fuente}, {resultado.fecha}): {motivo}.")
+                continue
             try:
-                cursor = db_conn.cursor()
-                cursor.execute("SELECT id FROM sorteos WHERE juego=? AND fecha=?", (juego, resultado.fecha))
-                if not cursor.fetchone():
-                    motivo = validar_resultado(juego, resultado.fecha, numeros_str, reintegro, db_conn)
-                    if motivo:
-                        log.warn(f"  {juego}: RECHAZADO, {motivo}. Fuente: {resultado.fuente}")
-                        return
-                    cursor.execute('INSERT INTO sorteos (juego, fecha, numeros, reintegro) VALUES (?, ?, ?, ?)', (juego, resultado.fecha, numeros_str, int(reintegro)))
-                    db_conn.commit()
-                    log.ok(f"  NUEVO SORTEO GUARDADO: {juego} - {resultado.fecha}")
-                else:
-                    log.info(f"  {juego}: {resultado.fecha} ya estaba registrado.")
+                cursor.execute('INSERT INTO sorteos (juego, fecha, numeros, reintegro) VALUES (?, ?, ?, ?)',
+                               (juego, resultado.fecha, numeros_str, int(reintegro)))
+                db_conn.commit()
+                log.ok(f"  NUEVO SORTEO GUARDADO: {juego} - {resultado.fecha} (vía {resultado.fuente})")
             except Exception as e_db:
                 log.error(f"  Error BD: {e_db}")
-        else:
-            log.warn(f"  No se pudieron obtener datos de {juego}.")
-
+            return
+        log.warn(f"  No se pudo obtener un resultado válido de {juego}.")
     except Exception as e:
         log.error(f"  Error fatal en scraper de {juego}: {e}")
 
@@ -713,7 +701,8 @@ def tarea_segundo_plano():
     try:
         bg_conn = sqlite3.connect('loteria_db.sqlite', timeout=10)
         log.info("=== Inicio sincronización ===")
-        for j in ["Bonoloto", "Eurodreams", "Loteria Nacional", "La Primitiva", "Euromillones"]:
+        # Bonoloto el último: así la validación detecta si una web le devuelve la combinación de la Primitiva
+        for j in ["La Primitiva", "Euromillones", "Eurodreams", "Loteria Nacional", "Bonoloto"]:
             actualizar_base_datos(j, bg_conn)
             time.sleep(1)
         log.info("=== Sincronización finalizada ===")
@@ -729,6 +718,14 @@ if 'bg_sync_started' not in st.session_state:
 # ==========================================
 # FUNCIONES VISUALES
 # ==========================================
+def color_texto_sobre(hex_color):
+    """Texto oscuro sobre fondos claros (p. ej. las estrellas amarillas) y blanco sobre oscuros."""
+    h = hex_color.lstrip('#')
+    r, g, b = (int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+    lin = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    lum = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    return "#1a1a1a" if lum > 0.4 else "#ffffff"
+
 def mostrar_bolas(apuestas, color_principal, color_extra, texto_extra="R"):
     st.markdown(f"""
     <style>
@@ -746,7 +743,7 @@ def mostrar_bolas(apuestas, color_principal, color_extra, texto_extra="R"):
             box-shadow: 2px 2px 5px rgba(0,0,0,0.2); background-color: {color_principal};
             line-height: 1;
         }}
-        .ball-extra {{ background-color: {color_extra}; margin-left: var(--ball-gap); font-size: calc(var(--ball) * 0.36); }}
+        .ball-extra {{ background-color: {color_extra}; color: {color_texto_sobre(color_extra)}; margin-left: var(--ball-gap); font-size: calc(var(--ball) * 0.36); }}
         .ball-extra + .ball-extra {{ margin-left: 0; }}
     </style>
     """, unsafe_allow_html=True)
@@ -798,7 +795,7 @@ def mostrar_ultimos_resultados(juego, alinear_con_boton=False):
             :root {{ --ball: clamp(30px, 9.4vw, 40px); --ball-gap: clamp(4px, 1.3vw, 7px); }}
             .res-balls {{ display: flex; align-items: center; justify-content: flex-start; flex-wrap: nowrap; gap: var(--ball-gap); }}
             .res-ball {{ flex: 0 0 var(--ball); width: var(--ball); height: var(--ball); box-sizing: border-box; display: flex; justify-content: center; align-items: center; border-radius: 50%; color: white; font-weight: bold; font-size: calc(var(--ball) * 0.42); background-color: {color_principal}; box-shadow: 2px 2px 5px rgba(0,0,0,0.2); line-height: 1; }}
-            .res-extra {{ background-color: {color_extra}; margin-left: var(--ball-gap); font-size: calc(var(--ball) * 0.36); }}
+            .res-extra {{ background-color: {color_extra}; color: {color_texto_sobre(color_extra)}; margin-left: var(--ball-gap); font-size: calc(var(--ball) * 0.36); }}
             .res-extra + .res-extra {{ margin-left: 0; }}
         </style>
         """, unsafe_allow_html=True)
@@ -847,9 +844,10 @@ st.markdown("""
     .log-panel { background: rgba(128,128,128,0.12); border: 1px solid rgba(128,128,128,0.3); border-radius: 6px; padding: 10px; margin-top: 10px; font-family: monospace; font-size: 11px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
     /* El menú lateral ya no se usa: la navegación va arriba */
     [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] { display: none !important; }
-    /* Barra superior: los 3 botones siempre en una sola fila, también en móvil */
-    .st-key-topnav [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 0.4rem !important; }
-    .st-key-topnav [data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }
+    /* Barra superior: 5 botones en una fila en pantalla ancha; en móvil, 3 + 2 centrados */
+    .st-key-topnav [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; justify-content: center !important; gap: 0.4rem !important; }
+    .st-key-topnav [data-testid="stColumn"] { min-width: 0 !important; flex: 0 0 calc((100% - 0.8rem) / 3) !important; width: calc((100% - 0.8rem) / 3) !important; }
+    @media (min-width: 900px) { .st-key-topnav [data-testid="stColumn"] { flex: 1 1 0 !important; width: auto !important; } }
     .st-key-topnav [data-testid="stColumn"] > div { gap: 0.35rem !important; }
     /* Caja de logo de tamaño fijo: todos centrados y a la misma altura, sea cual sea su proporción */
     .nav-logo { height: 96px; box-sizing: border-box; padding: 6px; margin-bottom: 4px; display: flex; align-items: center; justify-content: center; overflow: hidden; background: rgba(128,128,128,0.12); border: 1px solid rgba(128,128,128,0.25); border-radius: 8px; }
@@ -877,8 +875,8 @@ JUEGOS_NAV = [
 # ─── BARRA SUPERIOR DE NAVEGACIÓN (logo opcional + texto) ───
 # Logos (nombre de archivo sin extensión) que se muestran sobre fondo negro
 LOGOS_FONDO_NEGRO = set()  # p. ej. {"bonoloto"} para convertir blancos a negro
-# Logos oscuros que se pierden en el tema oscuro: se muestran sobre recuadro blanco
-LOGOS_FONDO_BLANCO = {"euromillones"}
+# Logos demasiado oscuros para el tema oscuro: se aclara su color (mismo fondo que los demás)
+LOGOS_RECOLOR = {"euromillones": {"#043F65": "#2F7DB8"}}
 
 def _blanco_a_negro(svg_texto):
     """Cambia los blancos del SVG (fondo incluido) por negro."""
@@ -898,8 +896,8 @@ def logo_html(ruta):
         if os.path.splitext(os.path.basename(svg))[0] in LOGOS_FONDO_NEGRO:
             contenido = _blanco_a_negro(contenido)
             estilo = " style='background:#000;'"
-        elif os.path.splitext(os.path.basename(svg))[0] in LOGOS_FONDO_BLANCO:
-            estilo = " style='background:#fff;'"
+        for viejo, nuevo in LOGOS_RECOLOR.get(os.path.splitext(os.path.basename(svg))[0], {}).items():
+            contenido = re.sub(re.escape(viejo), nuevo, contenido, flags=re.IGNORECASE)
         b64 = base64.b64encode(contenido.encode("utf-8")).decode()
         return f"<div class='nav-logo'{estilo}><img src='data:image/svg+xml;base64,{b64}'></div>"
     if not os.path.exists(ruta):
@@ -932,18 +930,16 @@ def _logo_b64(ruta):
     return f"<div class='nav-logo'><img src='data:image/png;base64,{b64}'></div>"
 
 with st.container(key="topnav"):
-    # Dos filas de 3 columnas (3 + 2) para que los botones quepan bien en móvil
-    for fila_nav in (JUEGOS_NAV[:3], JUEGOS_NAV[3:]):
-        cols_nav = st.columns(3)
-        for col, (clave, etiqueta, logo, key_btn) in zip(cols_nav, fila_nav):
-            with col:
-                html_logo = logo_html(logo)
-                if html_logo:
-                    st.markdown(html_logo, unsafe_allow_html=True)
-                activo = st.session_state.juego == clave
-                if st.button(etiqueta, key=key_btn, use_container_width=True, type="primary" if activo else "secondary"):
-                    st.session_state.juego = clave
-                    st.rerun()
+    cols_nav = st.columns(len(JUEGOS_NAV))
+    for col, (clave, etiqueta, logo, key_btn) in zip(cols_nav, JUEGOS_NAV):
+        with col:
+            html_logo = logo_html(logo)
+            if html_logo:
+                st.markdown(html_logo, unsafe_allow_html=True)
+            activo = st.session_state.juego == clave
+            if st.button(etiqueta, key=key_btn, use_container_width=True, type="primary" if activo else "secondary"):
+                st.session_state.juego = clave
+                st.rerun()
 
 # ─── HERRAMIENTAS (antes en el menú lateral): se muestran al final de la página ───
 def panel_herramientas():
