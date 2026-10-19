@@ -870,13 +870,15 @@ JUEGOS_NAV = [
     ("Bonoloto", "Bonoloto", "bonoloto.png", "nav_bono"),
     ("Eurodreams", "Eurodreams", "eurodreams.png", "nav_euro"),
     ("Loteria Nacional", "Lotería Nacional", "nacional.png", "nav_nac"),
-    ("La Primitiva", "La Primitiva", "primitiva.png", "nav_prim"),
+    ("La Primitiva", "La Primitiva", "laprimitiva.png", "nav_prim"),
     ("Euromillones", "Euromillones", "euromillones.png", "nav_euromil"),
 ]
 
 # ─── BARRA SUPERIOR DE NAVEGACIÓN (logo opcional + texto) ───
 # Logos (nombre de archivo sin extensión) que se muestran sobre fondo negro
 LOGOS_FONDO_NEGRO = set()  # p. ej. {"bonoloto"} para convertir blancos a negro
+# Logos oscuros que se pierden en el tema oscuro: se muestran sobre recuadro blanco
+LOGOS_FONDO_BLANCO = {"euromillones"}
 
 def _blanco_a_negro(svg_texto):
     """Cambia los blancos del SVG (fondo incluido) por negro."""
@@ -896,6 +898,8 @@ def logo_html(ruta):
         if os.path.splitext(os.path.basename(svg))[0] in LOGOS_FONDO_NEGRO:
             contenido = _blanco_a_negro(contenido)
             estilo = " style='background:#000;'"
+        elif os.path.splitext(os.path.basename(svg))[0] in LOGOS_FONDO_BLANCO:
+            estilo = " style='background:#fff;'"
         b64 = base64.b64encode(contenido.encode("utf-8")).decode()
         return f"<div class='nav-logo'{estilo}><img src='data:image/svg+xml;base64,{b64}'></div>"
     if not os.path.exists(ruta):
